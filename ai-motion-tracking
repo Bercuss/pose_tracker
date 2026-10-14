@@ -1,0 +1,139 @@
+import cv2
+import time
+import math
+from ultralytics import YOLO
+
+model = YOLO("yolov8n-pose.pt")
+cap = cv2.VideoCapture(0)
+
+# YOLOv8 COCO kulcspont-indexek
+JOINTS = {
+    "Bal csuklo": 9,
+    "Jobb csuklo": 10,
+    "Bal konyok": 7,
+    "Jobb konyok": 8,
+    "Bal terd": 13,
+    "Jobb terd": 14,
+    "Bal boka": 15,
+    "Jobb boka": 16,
+}
+
+# Minden ízület előző mérési adatai
+history = {}
+MIN_CONFIDENCE = 0.5
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    now = time.perf_counter()
+
+    results = model(frame, verbose=False)
+    result = results[0]
+    annotated = result.plot()
+
+    # Ha nem látunk embert, töröljük az előzményeket
+    if result.keypoints is None or len(result.keypoints.xy) == 0:
+        history.clear()
+        cv2.putText(
+            annotated, "Nem lathato ember",
+            (20, 35), cv2.FONT_HERSHEY_SIMPLEX,
+            0.8, (0, 0, 255), 2
+        )
+    else:
+        # A legnagyobb észlelt személy kiválasztása
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            areas = (
+                (boxes[:, 2] - boxes[:, 0]) *
+                (boxes[:, 3] - boxes[:, 1])
+            )
+            person_idx = int(areas.argmax())
+        else:
+            person_idx = 0
+
+        points = result.keypoints.xy[person_idx].cpu().numpy()
+
+        confs = None
+        if result.keypoints.conf is not None:
+            confs = result.keypoints.conf[person_idx].cpu().numpy()
+
+        y = 30
+
+        for name, idx in JOINTS.items():
+            x, py = points[idx]
+
+            confidence = (
+                float(confs[idx]) if confs is not None else 1.0
+            )
+
+            if confidence < MIN_CONFIDENCE:
+                history.pop(name, None)
+                continue
+
+            pos = (float(x), float(py))
+            old = history.get(name)
+            speed = None
+            acceleration = None
+            dt = None
+
+            if old is not None:
+                dt = now - old["time"]
+
+                # Csak érvényes időközzel számolunk
+                if 0.001 < dt < 0.5:
+                    vx = (pos[0] - old["pos"][0]) / dt
+                    vy = (pos[1] - old["pos"][1]) / dt
+                    speed = math.hypot(vx, vy)
+
+                    if old["vel"] is not None:
+                        avg_dt = (dt + old["dt"]) / 2
+                        if avg_dt > 0:
+                            ax = (vx - old["vel"][0]) / avg_dt
+                            ay = (vy - old["vel"][1]) / avg_dt
+                            acceleration = math.hypot(ax, ay)
+
+                    history[name] = {
+                        "pos": pos,
+                        "time": now,
+                        "vel": (vx, vy),
+                        "dt": dt,
+                    }
+                else:
+                    history[name] = {
+                        "pos": pos, "time": now,
+                        "vel": None, "dt": None,
+                    }
+            else:
+                history[name] = {
+                    "pos": pos, "time": now,
+                    "vel": None, "dt": None,
+                }
+
+            # Adatok kiírása a kép bal oldalára
+            if acceleration is not None:
+                label = f"{name}: {acceleration:.0f} px/s^2"
+                color = (0, 255, 0)
+            elif speed is not None:
+                label = f"{name}: meres..."
+                color = (0, 220, 255)
+            else:
+                label = f"{name}: varakozas..."
+                color = (255, 255, 255)
+
+            cv2.putText(
+                annotated, label, (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                color, 2, cv2.LINE_AA
+            )
+            y += 25
+
+    cv2.imshow("AI Mozgaskoveto - Gyorsulas", annotated)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
