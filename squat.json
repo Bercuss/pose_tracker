@@ -1,0 +1,19 @@
+{
+  "exercise": "squat",
+  "metadata": {
+    "fps": 30,
+    "description": "Szabályos guggolás oldalnézetből"
+  },
+  "frames": [
+    {
+      "frame_id": 1,
+      "knee_angle": 178.5,
+      "hip_angle": 175.2
+    },
+    {
+      "frame_id": 2,
+      "knee_angle": 170.1,
+      "hip_angle": 168.0
+    }
+  ]
+}
