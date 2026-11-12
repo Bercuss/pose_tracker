@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import cv2
 import time
 import math
@@ -68,26 +69,33 @@ JOINTS = {
     "Jobb terd": side(13, 14)[1],
     "Bal boka": side(15, 16)[0],
     "Jobb boka": side(15, 16)[1],
+    "Fej": 0,
+    "Bal vall": side(5, 6)[0],
+    "Jobb vall": side(5, 6)[1],
+    "Bal csipo": side(11, 12)[0],
+    "Jobb csipo": side(11, 12)[1],
+    "Nyak": None,
 }
 
+BASE_KEYPOINTS = {0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 USED_KEYPOINTS = sorted(
     {i for t in ARMS.values() for i in t}
     | {i for t in LEGS.values() for i in t}
-    | set(JOINTS.values())
+    | {JOINTS[k] for k in JOINTS if JOINTS[k] is not None}
+    | BASE_KEYPOINTS
 )
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 # ----------------------------------------------------------------------
-# Adatbazis inicializalasa
+# Adatbazis inicializalasa (bovitve torzs, medence es csipo adatokkal)
 # ----------------------------------------------------------------------
 
 def init_db():
     conn = sqlite3.connect("mozgas_adatok.db")
     cursor = conn.cursor()
 
-   
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS measurements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,9 +107,34 @@ def init_db():
             bal_csuklo_gyorsulas REAL,
             jobb_csuklo_gyorsulas REAL,
             bal_boka_gyorsulas REAL,
-            jobb_boka_gyorsulas REAL
+            jobb_boka_gyorsulas REAL,
+            fej_gyorsulas REAL,
+            nyak_gyorsulas REAL,
+            bal_vall_gyorsulas REAL,
+            jobb_vall_gyorsulas REAL,
+            bal_csipo_gyorsulas REAL,
+            jobb_csipo_gyorsulas REAL,
+            vall_szog REAL,
+            medence_szog REAL,
+            torzs_dolesszog REAL
         )
     """)
+    
+    existing_columns = [row[1] for row in cursor.execute("PRAGMA table_info(measurements)").fetchall()]
+    new_cols = [
+        ("fej_gyorsulas", "REAL"),
+        ("nyak_gyorsulas", "REAL"),
+        ("bal_vall_gyorsulas", "REAL"),
+        ("jobb_vall_gyorsulas", "REAL"),
+        ("bal_csipo_gyorsulas", "REAL"),
+        ("jobb_csipo_gyorsulas", "REAL"),
+        ("vall_szog", "REAL"),
+        ("medence_szog", "REAL"),
+        ("torzs_dolesszog", "REAL")
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE measurements ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
     return conn
@@ -116,9 +149,7 @@ def get_angle(a, b, c):
         np.arctan2(c[1] - b[1], c[0] - b[0])
         - np.arctan2(a[1] - b[1], a[0] - b[0])
     )
-
     deg = abs(rad * 180.0 / np.pi)
-
     return 360.0 - deg if deg > 180.0 else deg
 
 
@@ -229,7 +260,7 @@ class AngleTracker:
 
 
 # ----------------------------------------------------------------------
-# izuleti sebesseg es gyorsulas koveto
+# Izuleti sebesseg es gyorsulas koveto
 # ----------------------------------------------------------------------
 
 class PointTracker:
@@ -300,24 +331,23 @@ def pick_person(result):
 # ----------------------------------------------------------------------
 
 def draw_panel(frame, lines):
-    height = 14 + 24 * len(lines)
+    height = 14 + 22 * len(lines)
     overlay = frame.copy()
 
-    cv2.rectangle(overlay, (10, 10), (400, 10 + height), (30, 30, 30), -1)
+    cv2.rectangle(overlay, (10, 10), (440, 10 + height), (30, 30, 30), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-    y = 35
+    y = 30
     for text, color in lines:
-        cv2.putText(frame, text, (20, y), FONT, 0.55, color, 1, cv2.LINE_AA)
-        y += 24
+        cv2.putText(frame, text, (20, y), FONT, 0.45, color, 1, cv2.LINE_AA)
+        y += 22
 
 
 # ----------------------------------------------------------------------
-# Intel RealSense kamera inicializalasa
+# Kamera inicializalasa
 # ----------------------------------------------------------------------
 
 def start_camera():
-   
     try:
         pipeline = rs.pipeline()
         config = rs.config()
@@ -335,7 +365,6 @@ def start_camera():
     except Exception as e:
         print(f"RealSense nem talalhato ({e}), atvaltas sima webkamerara...")
     
-   
     cap = cv2.VideoCapture(0)
     if cap.isOpened():
         print("Sima webkamera sikeresen elinditva!")
@@ -376,8 +405,9 @@ def main():
 
     point_trackers = {
         name: PointTracker()
-        for name in JOINTS
+        for name in JOINTS if name != "Nyak"
     }
+    point_trackers["Nyak"] = PointTracker()
 
     body_h_ema = None
 
@@ -427,7 +457,16 @@ def main():
                 "bal_csuklo_gyorsulas": None,
                 "jobb_csuklo_gyorsulas": None,
                 "bal_boka_gyorsulas": None,
-                "jobb_boka_gyorsulas": None
+                "jobb_boka_gyorsulas": None,
+                "fej_gyorsulas": None,
+                "nyak_gyorsulas": None,
+                "bal_vall_gyorsulas": None,
+                "jobb_vall_gyorsulas": None,
+                "bal_csipo_gyorsulas": None,
+                "jobb_csipo_gyorsulas": None,
+                "vall_szog": None,
+                "medence_szog": None,
+                "torzs_dolesszog": None
             }
 
             if person is None:
@@ -439,10 +478,11 @@ def main():
 
                 fp = {}
                 for i in USED_KEYPOINTS:
-                    if confs[i] >= MIN_CONFIDENCE:
+                    if i < len(confs) and confs[i] >= MIN_CONFIDENCE:
                         fp[i] = kp_filters[i](points[i], now)
                     else:
-                        kp_filters[i].reset()
+                        if i in kp_filters:
+                            kp_filters[i].reset()
                         fp[i] = None
 
                 scale = 1.0
@@ -452,21 +492,13 @@ def main():
 
                 acc_floor = ACC_FLOOR / scale
 
-                # ------------------------------------------
-                # Karok es labak szogenek merese
-                # ------------------------------------------
-                lines.append(("--- Vegtagok (szog, szogsebesseg) ---", GRAY))
-
-                limb_colors = {
-                    "BAL kar": GREEN, "JOBB kar": ORANGE,
-                    "BAL lab": GREEN, "JOBB lab": ORANGE
-                }
+                lines.append(("--- Vegtagok (szog) ---", GRAY))
+                limb_colors = {"BAL kar": GREEN, "JOBB kar": ORANGE, "BAL lab": GREEN, "JOBB lab": ORANGE}
 
                 all_limbs = {**ARMS, **LEGS}
                 for name, (s, e, w) in all_limbs.items():
                     tracker = angle_trackers[name]
-
-                    if fp[s] is not None and fp[e] is not None and fp[w] is not None:
+                    if s in fp and e in fp and w in fp and fp[s] is not None and fp[e] is not None and fp[w] is not None:
                         angle = get_angle(fp[s], fp[e], fp[w])
                         tracker.update(angle, now)
 
@@ -475,35 +507,74 @@ def main():
                         elif name == "BAL lab": current_db_data["bal_terd_szog"] = angle
                         elif name == "JOBB lab": current_db_data["jobb_terd_szog"] = angle
 
-                        cv2.putText(
-                            annotated,
-                            f"{int(angle)} deg",
-                            (int(fp[e][0]), int(fp[e][1])),
-                            FONT, 0.5, YELLOW, 2, cv2.LINE_AA
-                        )
-
-                        lines.append(
-                            (
-                                f"{name}: {int(angle)} deg  {int(tracker.velocity):+d} deg/s",
-                                limb_colors[name]
-                            )
-                        )
+                        cv2.putText(annotated, f"{int(angle)} deg", (int(fp[e][0]), int(fp[e][1])), FONT, 0.5, YELLOW, 2, cv2.LINE_AA)
+                        lines.append((f"{name}: {int(angle)} deg {int(tracker.velocity):+d} deg/s", limb_colors[name]))
                     else:
                         tracker.reset()
                         lines.append((f"{name}: nem lathato", GRAY))
 
-                # ------------------------------------------
-                # izuletek gyorsulasanak merese
-                # ------------------------------------------
-                lines.append((f"--- Izuletek (gyorsulas, {unit}) ---", GRAY))
+                # Vallak es Nyak
+                left_shoulder_raw_idx = side(5, 6)[0]
+                right_shoulder_raw_idx = side(5, 6)[1]
+                neck_pos = None
+
+                if left_shoulder_raw_idx in fp and right_shoulder_raw_idx in fp and fp[left_shoulder_raw_idx] is not None and fp[right_shoulder_raw_idx] is not None:
+                    ls = fp[left_shoulder_raw_idx]
+                    rs_pt = fp[right_shoulder_raw_idx]
+                    dx = rs_pt[0] - ls[0]
+                    dy = rs_pt[1] - ls[1]
+                    shoulder_angle = math.degrees(math.atan2(dy, dx))
+                    current_db_data["vall_szog"] = shoulder_angle
+                    lines.append((f"Vall dolesszog: {shoulder_angle:.1f} deg", WHITE))
+                    
+                    neck_pos = ((ls[0] + rs_pt[0]) / 2.0, (ls[1] + rs_pt[1]) / 2.0)
+                    point_trackers["Nyak"].update((neck_pos[0] / scale, neck_pos[1] / scale), now, acc_floor)
+                    if point_trackers["Nyak"].acceleration is not None:
+                        current_db_data["nyak_gyorsulas"] = point_trackers["Nyak"].acceleration
+
+                # Medence es Torzs
+                left_hip_idx = side(11, 12)[0]
+                right_hip_idx = side(11, 12)[1]
+
+                if left_hip_idx in fp and right_hip_idx in fp and fp[left_hip_idx] is not None and fp[right_hip_idx] is not None:
+                    lh = fp[left_hip_idx]
+                    rh = fp[right_hip_idx]
+                    dx_hip = rh[0] - lh[0]
+                    dy_hip = rh[1] - lh[1]
+                    pelvis_angle = math.degrees(math.atan2(dy_hip, dx_hip))
+                    current_db_data["medence_szog"] = pelvis_angle
+                    lines.append((f"Medence dolesszog: {pelvis_angle:.1f} deg", WHITE))
+
+                    hip_center = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
+                    if neck_pos is not None:
+                        dx_torso = hip_center[0] - neck_pos[0]
+                        dy_torso = hip_center[1] - neck_pos[1]
+                        torso_angle = math.degrees(math.atan2(abs(dx_torso), abs(dy_torso)))
+                        current_db_data["torzs_dolesszog"] = torso_angle
+                        lines.append((f"Torzs doles: {torso_angle:.1f} deg", WHITE))
+
+                lines.append(("--- Fej, Nyak, Torzs (gyorsulas) ---", GRAY))
+
+                head_idx = 0
+                if head_idx in fp and fp[head_idx] is not None:
+                    hp = fp[head_idx]
+                    cv2.circle(annotated, (int(hp[0]), int(hp[1])), 5, YELLOW, -1)
+                    point_trackers["Fej"].update((hp[0] / scale, hp[1] / scale), now, acc_floor)
+                    if point_trackers["Fej"].acceleration is not None:
+                        current_db_data["fej_gyorsulas"] = point_trackers["Fej"].acceleration
+                        lines.append((f"Fej gyorsulas: {point_trackers['Fej'].acceleration:.0f} {unit}", GREEN))
+
+                if point_trackers["Nyak"].acceleration is not None:
+                    lines.append((f"Nyak gyorsulas: {point_trackers['Nyak'].acceleration:.0f} {unit}", GREEN))
 
                 for name, idx in JOINTS.items():
+                    if idx is None or name == "Fej":
+                        continue
                     tracker = point_trackers[name]
-                    p = fp[idx]
+                    p = fp[idx] if idx in fp else None
 
                     if p is None:
                         tracker.reset()
-                        lines.append((f"{name}: nem lathato", GRAY))
                         continue
 
                     cv2.circle(annotated, (int(p[0]), int(p[1])), 5, YELLOW, -1)
@@ -511,28 +582,19 @@ def main():
 
                     if tracker.acceleration is not None:
                         v = tracker.acceleration
-
                         if name == "Bal csuklo": current_db_data["bal_csuklo_gyorsulas"] = v
                         elif name == "Jobb csuklo": current_db_data["jobb_csuklo_gyorsulas"] = v
                         elif name == "Bal boka": current_db_data["bal_boka_gyorsulas"] = v
                         elif name == "Jobb boka": current_db_data["jobb_boka_gyorsulas"] = v
+                        elif name == "Bal vall": current_db_data["bal_vall_gyorsulas"] = v
+                        elif name == "Jobb vall": current_db_data["jobb_vall_gyorsulas"] = v
+                        elif name == "Bal csipo": current_db_data["bal_csipo_gyorsulas"] = v
+                        elif name == "Jobb csipo": current_db_data["jobb_csipo_gyorsulas"] = v
 
-                        text = (
-                            f"{name}: {v:.2f} {unit}"
-                            if NORMALIZE_BY_BODY
-                            else f"{name}: {v:.0f} {unit}"
-                        )
-                        lines.append((text, GREEN))
-                    elif tracker.speed is not None:
-                        lines.append((f"{name}: meres...", YELLOW))
-                    else:
-                        lines.append((f"{name}: varakozas...", WHITE))
+                        lines.append((f"{name}: {v:.0f} {unit}", GREEN))
 
                 draw_panel(annotated, lines)
 
-                # ------------------------------------------
-                # Adatok mentese az adatbazisba
-                # ------------------------------------------
                 db_cursor.execute(
                     """
                     INSERT INTO measurements (
@@ -543,9 +605,18 @@ def main():
                         bal_csuklo_gyorsulas,
                         jobb_csuklo_gyorsulas,
                         bal_boka_gyorsulas,
-                        jobb_boka_gyorsulas
+                        jobb_boka_gyorsulas,
+                        fej_gyorsulas,
+                        nyak_gyorsulas,
+                        bal_vall_gyorsulas,
+                        jobb_vall_gyorsulas,
+                        bal_csipo_gyorsulas,
+                        jobb_csipo_gyorsulas,
+                        vall_szog,
+                        medence_szog,
+                        torzs_dolesszog
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         current_db_data["bal_kar_szog"],
@@ -555,19 +626,20 @@ def main():
                         current_db_data["bal_csuklo_gyorsulas"],
                         current_db_data["jobb_csuklo_gyorsulas"],
                         current_db_data["bal_boka_gyorsulas"],
-                        current_db_data["jobb_boka_gyorsulas"]
+                        current_db_data["jobb_boka_gyorsulas"],
+                        current_db_data["fej_gyorsulas"],
+                        current_db_data["nyak_gyorsulas"],
+                        current_db_data["bal_vall_gyorsulas"],
+                        current_db_data["jobb_vall_gyorsulas"],
+                        current_db_data["bal_csipo_gyorsulas"],
+                        current_db_data["jobb_csipo_gyorsulas"],
+                        current_db_data["vall_szog"],
+                        current_db_data["medence_szog"],
+                        current_db_data["torzs_dolesszog"]
                     )
                 )
-
                 db_conn.commit()
 
-           
-            print(
-                f"{current_db_data['bal_csuklo_gyorsulas']} --- "
-                f"{current_db_data['jobb_csuklo_gyorsulas']}"
-            )
-
-           
             cv2.imshow("AI Mozgaskoveto - Intel RealSense", annotated)
 
             key = cv2.waitKey(1) & 0xFF
@@ -583,7 +655,7 @@ def main():
     finally:
         if pipeline is not None:
             if camera_type == "realsense":
-               pipeline.stop()
+                pipeline.stop()
             else:
                 pipeline.release()
         db_conn.close()
