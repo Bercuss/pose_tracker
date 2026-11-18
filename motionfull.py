@@ -5,10 +5,13 @@ import math
 import sqlite3
 import numpy as np
 import pyrealsense2 as rs
+import json
+import uuid
+import traceback
 
 from collections import deque
 from ultralytics import YOLO
-
+from pathlib import Path
 
 # ----------------------------------------------------------------------
 # Beallitasok
@@ -36,6 +39,10 @@ ANGLE_SMOOTH = 0.4
 ACC_SMOOTH = 0.4
 
 NORMALIZE_BY_BODY = False
+
+BASE_DIR = Path(__file__).resolve().parent
+REFERENCE_FILE = BASE_DIR / "squat_recorded.json"
+DATABASE_FILE = BASE_DIR / "mozgas_adatok.db"
 
 # ----------------------------------------------------------------------
 # Intel RealSense kamera beallitasok
@@ -93,7 +100,7 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 # ----------------------------------------------------------------------
 
 def init_db():
-    conn = sqlite3.connect("mozgas_adatok.db")
+    conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -122,6 +129,14 @@ def init_db():
     
     existing_columns = [row[1] for row in cursor.execute("PRAGMA table_info(measurements)").fetchall()]
     new_cols = [
+        ("bal_kar_szog", "REAL"),
+        ("jobb_kar_szog", "REAL"),
+        ("bal_terd_szog", "REAL"),
+        ("jobb_terd_szog", "REAL"),
+        ("bal_csuklo_gyorsulas", "REAL"),
+        ("jobb_csuklo_gyorsulas", "REAL"),
+        ("bal_boka_gyorsulas", "REAL"),
+        ("jobb_boka_gyorsulas", "REAL"),
         ("fej_gyorsulas", "REAL"),
         ("nyak_gyorsulas", "REAL"),
         ("bal_vall_gyorsulas", "REAL"),
@@ -130,7 +145,10 @@ def init_db():
         ("jobb_csipo_gyorsulas", "REAL"),
         ("vall_szog", "REAL"),
         ("medence_szog", "REAL"),
-        ("torzs_dolesszog", "REAL")
+        ("torzs_dolesszog", "REAL"),
+        ("terd_szog", "REAL"),
+        ("csipo_szog", "REAL"),
+        ("meres_idopont", "REAL")
     ]
     for col_name, col_type in new_cols:
         if col_name not in existing_columns:
@@ -377,15 +395,244 @@ def start_camera():
 # Foprogram
 # ----------------------------------------------------------------------
 
+def extract_squat_segment(frames):
+    if len(frames) < 10:
+        raise ValueError("Tul rovid a felvetel!")
+    knees = np.array([
+        float(f["knee_angle"]) for f in frames])
+
+    smooth = np.array([
+        np.median(knees[max(0, i - 2):i + 3])
+        for i in range(len(knees))])
+    upright = float(np.percentile(smooth, 90))
+
+    bottom = int(np.argmin(smooth))
+
+    if upright - smooth[bottom] < 35:
+        raise ValueError(
+            "Nem sikerult egyertelmu guggolast felismerni!")
+
+    threshold = upright - 12
+
+    before = np.where(
+        smooth[:bottom] >= threshold)[0]
+
+    after = np.where(
+        smooth[bottom + 1:] >= threshold)[0]
+
+    if len(before) == 0 or len(after) == 0:
+        raise ValueError(
+            "Nem talalhato teljes guggolas!")
+
+    start = int(before[-1])
+    end = int(bottom + 1 + after[0])
+
+    if end - start < 5:
+        raise ValueError("Tul rovid a guggolas!")
+
+    return frames[start:end + 1]
+
+def compare_squat_dtw(reference, live):
+    a = np.array([
+        [float(f["knee_angle"]), float(f["hip_angle"])]
+        for f in reference])
+
+    b = np.array([
+        [float(f["knee_angle"]), float(f["hip_angle"])]
+        for f in live
+    ])
+
+    n = len(a)
+    m = len(b)
+
+    costs = np.full((n + 1, m + 1), np.inf)
+    moves = np.zeros((n + 1, m + 1), dtype=np.uint8)
+    costs[0, 0] = 0.0
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+
+            local_cost = float(
+                np.abs(a[i - 1] - b[j - 1]).mean())
+
+            neighbors = (
+                costs[i - 1, j - 1],
+                costs[i - 1, j],
+                costs[i, j - 1])
+
+            move = int(np.argmin(neighbors))
+            moves[i, j] = move
+            costs[i, j] = (
+                local_cost + neighbors[move]
+            )
+
+    i = n
+    j = m
+    knee_sum = 0.0
+    hip_sum = 0.0
+    pairs = 0
+
+    while i > 0 and j > 0:
+        knee_sum += abs(
+            a[i - 1, 0] - b[j - 1, 0])
+
+        hip_sum += abs(
+            a[i - 1, 1] - b[j - 1, 1])
+
+        pairs += 1
+        move = moves[i, j]
+
+        if move == 0:
+            i -= 1
+            j -= 1
+        elif move == 1:
+            i -= 1
+        else:
+            j -= 1
+
+    knee_error = knee_sum / pairs
+    hip_error = hip_sum / pairs 
+
+    score = max(
+        0.0,
+        100.0 - (knee_error + hip_error) / 2)
+
+    return {
+        "knee_error": float(knee_error),
+        "hip_error": float(hip_error),
+        "score": float(score)}
+    
+def split_squat_repetitions(frames):
+    if len(frames) < 15:
+        return []
+
+    knees = np.array([
+        float(f["knee_angle"]) for f in frames])
+
+    hips = np.array([
+        float(f["hip_angle"]) for f in frames])
+
+    def smooth(values):
+        return np.array([
+            np.median(values[max(0, i - 2):min(len(values), i + 3)])
+            for i in range(len(values))
+        ])
+
+    knees = smooth(knees)
+    hips = smooth(hips)
+
+    stand_knee = float(np.percentile(knees, 85))
+    stand_hip = float(np.percentile(hips, 85))
+
+    repetitions = []
+    start = None
+    min_knee = None
+    min_hip = None
+
+    for i in range(len(frames)):
+        current_time = float(frames[i]["time_s"])
+
+        if i > 0:
+            previous_time = float(frames[i - 1]["time_s"])
+            if current_time - previous_time > 1.0: 
+                start = None
+
+        if start is None:
+            if ( knees[i] < stand_knee - 20 and hips[i] < stand_hip - 12):
+                start = max(0, i - 3)
+                min_knee = knees[i]
+                min_hip = hips[i]
+
+            continue
+
+        min_knee = min(min_knee, knees[i])
+        min_hip = min(min_hip, hips[i])
+
+        duration = (current_time - float(frames[start]["time_s"]))
+
+        if duration > 10: 
+            start = None
+            continue
+
+        if (knees[i] >= stand_knee - 12 and hips[i] >= stand_hip - 14):
+            
+            valid = ( 
+                min_knee <= stand_knee - 40
+                and min_hip <= stand_hip - 22
+                and duration >= 0.5  and i - start + 1 >= 8 )
+
+            if valid:
+                repetitions.append(frames[start:i + 1])
+
+            start = None
+
+    return repetitions
+
+
+def load_comparison_frames_from_db(conn, first_id, last_id):
+    rows = conn.execute("""
+        SELECT id, terd_szog, csipo_szog, meres_idopont
+        FROM measurements
+        WHERE id > ? AND id <= ?
+            AND terd_szog IS NOT NULL
+            AND csipo_szog IS NOT NULL
+            AND meres_idopont IS NOT NULL
+        ORDER BY id
+    """, (first_id, last_id)).fetchall()
+
+    if len(rows) < 10:
+        raise ValueError(
+            "Nincs eleg uj szogadat az adatbazisban!")
+
+    t0 = float(rows[0][3])
+    frames = []
+    for frame_id, knee, hip, timestamp in rows:
+        if not all(
+            math.isfinite(float(v))
+            for v in (knee, hip, timestamp)
+        ): continue
+        frames.append({
+            "frame_id": frame_id,
+            "time_s": float(timestamp) - t0,
+            "knee_angle": float(knee),
+            "hip_angle": float(hip)})
+        
+    if len(frames) < 10:
+            raise ValueError("Tul keves ervenyes meres!")
+        
+    return frames
+
+
 def main():
     print("YOLO modell betoltese...")
     model = YOLO(MODEL_NAME)
+    comparison_session_id = None
+
+    try:
+        squat_reference, reference_fps = load_squat_reference(
+        REFERENCE_FILE)
+
+        print(
+            f"Referencia betoltve: {len(squat_reference)} kepkocka")
+        
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        squat_reference = []
+        reference_fps = CAMERA_FPS
+        
+        print(
+            "Nincs referenciafajl. "
+            "Az S billentyuvel rogzithetsz egyet.")
 
     db_conn = init_db()
     db_cursor = db_conn.cursor()
 
     pipeline = None
     camera_type = None
+
+    recording = False
+    recorded_frames = []
+    recording_start = None
+
     try:
         pipeline, camera_type = start_camera()
     except Exception as e:
@@ -410,9 +657,16 @@ def main():
     point_trackers["Nyak"] = PointTracker()
 
     body_h_ema = None
+    squat_start_time = None
+
+    comparison_recording = False
+    comparison_start_id = None
+    last_comparison = None
 
     def reset_all():
-        nonlocal body_h_ema
+        nonlocal body_h_ema, squat_start_time
+        squat_start_time = None
+
         for f in kp_filters.values():
             f.reset()
         for t in angle_trackers.values():
@@ -466,7 +720,10 @@ def main():
                 "jobb_csipo_gyorsulas": None,
                 "vall_szog": None,
                 "medence_szog": None,
-                "torzs_dolesszog": None
+                "torzs_dolesszog": None,
+                "terd_szog": None,
+                "csipo_szog": None,
+                "meres_idopont": None
             }
 
             if person is None:
@@ -486,6 +743,54 @@ def main():
                         fp[i] = None
 
                 scale = 1.0
+
+                shoulder_indices = side(5, 6)
+                squat_candidates = []
+
+                for shoulder_idx, (hip_idx, knee_idx, ankle_idx) in zip(shoulder_indices, LEGS.values()):
+                    needed = (shoulder_idx, hip_idx, knee_idx, ankle_idx)
+
+                    if all(idx in fp and fp[idx] is not None for idx in needed):
+                        confidence_score = sum(float(confs[idx]) for idx in needed)
+
+                        knee_angle = get_angle(
+                            fp[hip_idx],
+                            fp[knee_idx],
+                            fp[ankle_idx])
+
+                        hip_angle = get_angle(
+                            fp[shoulder_idx],
+                            fp[hip_idx],
+                            fp[knee_idx])
+
+                        squat_candidates.append((confidence_score, knee_angle, hip_angle))
+
+                if squat_candidates:
+                    _, live_knee, live_hip = max(
+                            squat_candidates,
+                            key=lambda item: item[0])
+
+                    current_db_data["terd_szog"] = float(live_knee)
+                    current_db_data["csipo_szog"] = float(live_hip)
+                    current_db_data["meres_idopont"] = time.time()
+
+                    if recording:
+                        recorded_frames.append({
+                            "frame_id": len(recorded_frames) + 1,
+                            "time_s": round(now - recording_start, 3),
+                            "knee_angle": round(float(live_knee), 2),
+                            "hip_angle": round(float(live_hip), 2) 
+                        })
+                                                      
+                    lines.append(("--- Guggolas osszehasonlitas ---", GRAY))
+
+                    lines.append((
+                        f"Terdeszog: {live_knee:.1f} fok", GREEN))
+
+                    lines.append((f"Csiposzog: {live_hip:.1f} fok",GREEN))
+                else:
+                    lines.append(("Nem lathato eleg testpont!", GRAY))
+
                 if NORMALIZE_BY_BODY and body_h:
                     body_h_ema = body_h if body_h_ema is None else 0.9 * body_h_ema + 0.1 * body_h
                     scale = body_h_ema
@@ -614,9 +919,12 @@ def main():
                         jobb_csipo_gyorsulas,
                         vall_szog,
                         medence_szog,
-                        torzs_dolesszog
+                        torzs_dolesszog,
+                        terd_szog,
+                        csipo_szog,
+                        meres_idopont
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         current_db_data["bal_kar_szog"],
@@ -635,10 +943,31 @@ def main():
                         current_db_data["jobb_csipo_gyorsulas"],
                         current_db_data["vall_szog"],
                         current_db_data["medence_szog"],
-                        current_db_data["torzs_dolesszog"]
+                        current_db_data["torzs_dolesszog"],
+                        current_db_data["terd_szog"],
+                        current_db_data["csipo_szog"],
+                        current_db_data["meres_idopont"]
                     )
                 )
                 db_conn.commit()
+
+
+            if comparison_recording:
+                cv2.putText(annotated, f"DB meres folyamatban - E: stop",
+                            (20, annotated.shape[0] - 65), FONT, 0.6,(0, 255, 255), 2, cv2.LINE_AA)
+            elif last_comparison is not None:
+                cv2.putText(annotated, f"DTW terd: {last_comparison['knee_error']:.1f} "
+                            f"csipo: {last_comparison['hip_error']:.1f} fok", (20, annotated.shape[0] - 65),
+                            FONT, 0.5, GREEN, 2, cv2.LINE_AA)
+
+                cv2.putText(annotated, f"Egyezes: {last_comparison['score']:.1f}%", 
+                            (20, annotated.shape[0] - 40), FONT, 0.6, GREEN, 2, cv2.LINE_AA)
+                
+
+
+            if recording:
+                cv2.putText(annotated, f"REC - {len(recorded_frames)} frame",
+                            (20, annotated.shape[0] - 20), FONT, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
             cv2.imshow("AI Mozgaskoveto - Intel RealSense", annotated)
 
@@ -647,11 +976,99 @@ def main():
                 break
             if key == ord("r"):
                 reset_all()
+            if key == ord("s"):
+                if not recording:
+                    recording = True
+                    recorded_frames = []
+                    recording_start = time.perf_counter()
+                    print("Guggolas rogzitese elindult!")
+                else:
+                    recording = False
+                    if recorded_frames:
+                        if len(recorded_frames) >= 2:
+                            duration = (
+                                recorded_frames[-1]["time_s"] -
+                                recorded_frames[0]["time_s"])
+
+                            measured_fps = (
+                                (len(recorded_frames) - 1) / duration
+                                if duration > 0 else CAMERA_FPS)
+
+                        else: measured_fps = CAMERA_FPS
+
+                        data = {
+                            "exercise": "squat",
+                            "metadata": {
+                                "fps": round(measured_fps, 2),
+                                "description": "Rogzitett guggolas"},
+                            "frames": recorded_frames}
+
+                        with open(
+                                REFERENCE_FILE,
+                                "w", encoding="utf-8"
+                        ) as file:
+                                json.dump(
+                                    data,
+                                    file,
+                                    indent=4,
+                                    ensure_ascii=False)
+                        print(f"Rogzites kesz: {len(recorded_frames)} kepkocka")
+                        squat_reference, reference_fps = load_squat_reference(REFERENCE_FILE)
+                    else:
+                        print("Nem sikerult testpontokat rogizteni!")
+            if key == ord("e"):
+                if not comparison_recording:
+                    if recording: print("Elobb allitsd le az S rogzitest!")
+
+                    elif not squat_reference:
+                        print("Nincs referencia!")
+
+                    else:
+                        comparison_recording = True
+                        comparison_start_id = db_conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) FROM measurements").fetchone()[0]
+                        last_comparison = None
+                        print("Adatbazisos guggolasmeres elindult!")
+                else:
+                    comparison_recording = False
+
+                    try:
+                        end_id = db_conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) FROM measurements").fetchone()[0]
+
+                        reference_segment = extract_squat_segment(squat_reference) 
+
+                        db_frames = load_comparison_frames_from_db(
+                            db_conn,
+                            comparison_start_id,
+                            end_id)  
+
+                        repetitions = split_squat_repetitions(db_frames) 
+
+                        print(f"Felismert guggolasok: {len(repetitions)}")   
+
+                        for i, rep in enumerate(repetitions, 1):
+                            result = compare_squat_dtw(reference_segment, rep)
+
+                            last_comparison = result
+
+                            print(f"{i}. guggolas: "
+                                f"terd={result['knee_error']:.1f} fok, "
+                                f"csipo={result['hip_error']:.1f} fok, "
+                                f"egyezes={result['score']:.1f}%")
+
+
+                        
+                    except (ValueError, sqlite3.Error) as error:
+                        print(f"Osszehasonlitasi hiba: {error}")
+                        traceback.print_exc()
+
 
     except KeyboardInterrupt:
         print("Program megszakitva.")
     except Exception as e:
         print(f"Feldolgozasi hiba: {e}")
+        traceback.print_exc()
     finally:
         if pipeline is not None:
             if camera_type == "realsense":
@@ -663,6 +1080,19 @@ def main():
         print("Kamera leallitva.")
         print("Adatbazis kapcsolat lezarva.")
 
+def load_squat_reference(filename):
+    with open(filename, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if data.get("exercise") != "squat":
+        raise ValueError("Nem megfelelő gyakorlat!")
+
+    frames = data.get("frames", [])
+
+    if not frames:
+        raise ValueError("Nincs referenciaadat!")
+
+    return frames, float(data.get("metadata", {}).get("fps", 30))
 
 if __name__ == "__main__":
     main()
